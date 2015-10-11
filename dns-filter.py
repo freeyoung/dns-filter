@@ -18,6 +18,8 @@
      [3] http://en.wikipedia.org/wiki/Wildcard_DNS_record
      [4] http://en.wikipedia.org/wiki/Site_Finder
 
+  Additionally, this program can also strip unwanted A records from the
+  responses returned by upstream.
 
    Copyright (C) 2007  Chris Lamb <chris@chris-lamb.co.uk>
 
@@ -40,20 +42,26 @@ import ConfigParser
 
 from twisted.names import client, server, dns, error
 from twisted.python import failure
-from twisted.internet import reactor
 from twisted.application import service, internet
-from twisted.internet.protocol import Factory, Protocol
 
 try:
     config = ConfigParser.ConfigParser()
     config.read(('dns-filter.conf', '/etc/dns-filter.conf'))
-    master = config.get('dns-filter', 'master')
+    upstream_host = config.get('dns-filter', 'upstream_host')
+    upstream_port = int(config.get('dns-filter', 'upstream_port'))
+    listen_host = config.get('dns-filter', 'listen_host')
+    listen_port = int(config.get('dns-filter', 'listen_port'))
+
+    stripped = [
+        x.strip() for x in config.get('dns-filter', 'stripped').split(',')
+    ]
     invalid = [
         x.strip() for x in config.get('dns-filter', 'invalid').split(',')
     ]
 except ConfigParser.NoSectionError:
     print "Configuration error"
     sys.exit(-1)
+
 
 class MyResolver(client.Resolver):
     def filterAnswers(self, x):
@@ -64,9 +72,14 @@ class MyResolver(client.Resolver):
             f = self._errormap.get(x.rCode, error.DNSUnknownError)(x)
             return failure.Failure(f)
 
-        # We're only interested in 'A' records
         for y in x.answers:
+            # We're only interested in 'A' records
             if not isinstance(y.payload, dns.Record_A):
+                continue
+
+            # Strip unwanted IPs
+            if y.payload.dottedQuad() in self.stripped:
+                x.answers.remove(y)
                 continue
 
             # Report failure if we encounter one of the invalid
@@ -77,12 +90,17 @@ class MyResolver(client.Resolver):
         return (x.answers, x.authority, x.additional)
 
 # Configure our custom resolver
-resolver = MyResolver(servers=[(master, 53)])
+resolver = MyResolver(servers=[(upstream_host, upstream_port)])
 resolver.invalid = invalid
+resolver.stripped = stripped
 
 factory = server.DNSServerFactory(clients=[resolver])
 protocol = dns.DNSDatagramProtocol(factory)
 
-dnsFilterService = internet.UDPServer(53, protocol)
+dnsFilterService = internet.UDPServer(
+    listen_port,
+    protocol,
+    listen_host,
+)
 application = service.Application("DNS filter")
 dnsFilterService.setServiceParent(application)
