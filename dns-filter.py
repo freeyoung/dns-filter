@@ -43,6 +43,7 @@
 import os
 import sys
 import json
+import socket
 
 from netaddr import IPNetwork, IPAddress
 from twisted.names import client, server, dns, error, resolve
@@ -183,6 +184,11 @@ class MyDNSServerFactory(server.DNSServerFactory):
     def handleQuery(self, message, protocol, address):
         query = message.queries[0]
         cliAddr = address[0]
+
+        if typeToMethod[query.type] in queryWithAddr and message.additional:
+            additional_rr = message.additional[0]
+            if additional_rr.type == 41 and additional_rr.rdlength > 8:
+                cliAddr = socket.inet_ntoa(additional_rr.payload.data[-4:])
 
         return self.resolver.query(query, addr=cliAddr).addCallback(
             self.gotResolverResponse, protocol, message, address
