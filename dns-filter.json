@@ -1,0 +1,29 @@
+{
+    "server": {
+        "upstream": {
+            "host": "8.8.8.8",
+            "port": 53
+        },
+        "listen": {
+            "host": "127.0.0.1",
+            "port": 53535
+        }
+    },
+    "rules": {
+        "_comment": {
+            "stripped": "Strip these following addresses from responses.",
+            "invalid": "Return empty if one of these addresses is offered.",
+            "screened": "Return empty if query matches these subnet/domain mappings."
+        },
+        "stripped": [
+            "70.39.191.139"
+        ],
+        "invalid": [
+            "195.238.237.142",
+            "195.238.237.142"
+        ],
+        "screened": {
+            "192.168.0.0/16": ["example.com"]
+        }
+    }
+}
