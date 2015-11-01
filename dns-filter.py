@@ -21,6 +21,9 @@
   Additionally, this program can also strip unwanted A records from the
   responses returned by upstream.
 
+  Another feature called "screened domains" is supported, with which this
+  program can screen specified domains per given src-subnets.
+
    Copyright (C) 2007  Chris Lamb <chris@chris-lamb.co.uk>
 
    This program is free software: you can redistribute it and/or modify
@@ -37,33 +40,93 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+import os
 import sys
-import ConfigParser
+import json
 
-from twisted.names import client, server, dns, error
+from netaddr import IPNetwork, IPAddress
+from twisted.names import client, server, dns, error, resolve
 from twisted.python import failure
 from twisted.application import service, internet
+from twisted.internet import defer
+
+
+typeToMethod = {
+    dns.A:     'lookupAddress',
+    dns.AAAA:  'lookupIPV6Address',
+    dns.A6:    'lookupAddress6',
+    dns.NS:    'lookupNameservers',
+    dns.CNAME: 'lookupCanonicalName',
+    dns.SOA:   'lookupAuthority',
+    dns.MB:    'lookupMailBox',
+    dns.MG:    'lookupMailGroup',
+    dns.MR:    'lookupMailRename',
+    dns.NULL:  'lookupNull',
+    dns.WKS:   'lookupWellKnownServices',
+    dns.PTR:   'lookupPointer',
+    dns.HINFO: 'lookupHostInfo',
+    dns.MINFO: 'lookupMailboxInfo',
+    dns.MX:    'lookupMailExchange',
+    dns.TXT:   'lookupText',
+    dns.SPF:   'lookupSenderPolicy',
+
+    dns.RP:    'lookupResponsibility',
+    dns.AFSDB: 'lookupAFSDatabase',
+    dns.SRV:   'lookupService',
+    dns.NAPTR: 'lookupNamingAuthorityPointer',
+    dns.AXFR:         'lookupZone',
+    dns.ALL_RECORDS:  'lookupAllRecords',
+}
+
+
+queryWithAddr = (
+    'lookupAddress',
+)
+
+
+config_file = os.environ.get("DNS_FILTER_CONF", "/etc/dns-filter.json")
 
 try:
-    config = ConfigParser.ConfigParser()
-    config.read(('dns-filter.conf', '/etc/dns-filter.conf'))
-    upstream_host = config.get('dns-filter', 'upstream_host')
-    upstream_port = int(config.get('dns-filter', 'upstream_port'))
-    listen_host = config.get('dns-filter', 'listen_host')
-    listen_port = int(config.get('dns-filter', 'listen_port'))
+    with open(config_file, "r") as f:
+        config = json.load(f)
+except IOError:
+    print "Config file not found."
+    sys.exit(2)
+except ValueError:
+    print "Failed to parse config file."
+    sys.exit(1)
 
-    stripped = [
-        x.strip() for x in config.get('dns-filter', 'stripped').split(',')
-    ]
-    invalid = [
-        x.strip() for x in config.get('dns-filter', 'invalid').split(',')
-    ]
-except ConfigParser.NoSectionError:
-    print "Configuration error"
-    sys.exit(-1)
+
+class FailureHandler:
+    def __init__(self, resolver, query, timeout, addr=None):
+        self.resolver = resolver
+        self.query = query
+        self.timeout = timeout
+        self.addr = addr
+
+    def __call__(self, failure):
+        # AuthoritativeDomainErrors should halt resolution attempts
+        failure.trap(error.DomainError, defer.TimeoutError, NotImplementedError)
+        return self.resolver(self.query, self.timeout, self.addr)
 
 
 class MyResolver(client.Resolver):
+    def query(self, query, timeout=None, addr=None):
+        try:
+            if typeToMethod[query.type] in queryWithAddr:
+                return self.typeToMethod[query.type](str(query.name), timeout, addr)
+            else:
+                return self.typeToMethod[query.type](str(query.name), timeout)
+        except KeyError:
+            return defer.fail(failure.Failure(NotImplementedError(str(self.__class__) + " " + str(query.type))))
+
+    def lookupAddress(self, name, timeout=None, addr=None):
+        if self.screened:
+            for subnet in self.screened:
+                if IPAddress(addr) in IPNetwork(subnet) and name in self.screened[subnet]:
+                    return defer.fail(error.DomainError())
+        return self._lookup(name, dns.IN, dns.A, timeout)
+
     def filterAnswers(self, x):
         if x.trunc:
             return self.queryTCP(x.queries).addCallback(self.filterAnswers)
@@ -89,18 +152,75 @@ class MyResolver(client.Resolver):
 
         return (x.answers, x.authority, x.additional)
 
-# Configure our custom resolver
-resolver = MyResolver(servers=[(upstream_host, upstream_port)])
-resolver.invalid = invalid
-resolver.stripped = stripped
 
-factory = server.DNSServerFactory(clients=[resolver])
+class MyResolverChain(resolve.ResolverChain):
+
+    def _lookup(self, name, cls, type, timeout, addr=None):
+        if not self.resolvers:
+            return defer.fail(dns.DomainError())
+        q = dns.Query(name, type, cls)
+        d = self.resolvers[0].query(q, timeout, addr)
+        for r in self.resolvers[1:]:
+            d = d.addErrback(
+                FailureHandler(r.query, q, timeout, addr)
+            )
+        return d
+
+    def query(self, query, timeout=None, addr=None):
+        try:
+            if typeToMethod[query.type] in queryWithAddr:
+                return self.typeToMethod[query.type](str(query.name), timeout, addr)
+            else:
+                return self.typeToMethod[query.type](str(query.name), timeout)
+        except KeyError:
+            return defer.fail(failure.Failure(NotImplementedError(str(self.__class__) + " " + str(query.type))))
+
+    def lookupAddress(self, name, timeout=None, addr=None):
+        return self._lookup(name, dns.IN, dns.A, timeout, addr)
+
+
+class MyDNSServerFactory(server.DNSServerFactory):
+    def handleQuery(self, message, protocol, address):
+        query = message.queries[0]
+        cliAddr = address[0]
+
+        return self.resolver.query(query, addr=cliAddr).addCallback(
+            self.gotResolverResponse, protocol, message, address
+        ).addErrback(
+            self.gotResolverError, protocol, message, address
+        )
+
+    def __init__(self, authorities=None, caches=None, clients=None, verbose=0):
+        resolvers = []
+        if authorities is not None:
+            resolvers.extend(authorities)
+        if caches is not None:
+            resolvers.extend(caches)
+        if clients is not None:
+            resolvers.extend(clients)
+
+        self.canRecurse = not not clients
+        self.resolver = MyResolverChain(resolvers)
+        self.verbose = verbose
+        if caches:
+            self.cache = caches[-1]
+        self.connections = []
+
+
+# Configure our custom resolver
+resolver = MyResolver(servers=[(config['server']['upstream']['host'],
+                                config['server']['upstream']['port'])])
+resolver.invalid = config['rules']['invalid']
+resolver.stripped = config['rules']['stripped']
+resolver.screened = config['rules']['screened']
+
+factory = MyDNSServerFactory(clients=[resolver])
 protocol = dns.DNSDatagramProtocol(factory)
 
 dnsFilterService = internet.UDPServer(
-    listen_port,
+    config['server']['listen']['port'],
     protocol,
-    listen_host,
+    config['server']['listen']['host'],
 )
 application = service.Application("DNS filter")
 dnsFilterService.setServiceParent(application)
